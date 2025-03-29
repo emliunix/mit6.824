@@ -7,7 +7,7 @@ package main
 //
 
 import "fmt"
-import "../mr"
+import "mit.edu/distsys/mr"
 import "plugin"
 import "os"
 import "log"
