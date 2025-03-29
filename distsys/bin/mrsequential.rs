@@ -2,8 +2,6 @@ use clap::Parser;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt as _;
 
-mod apps;
-
 #[derive(Parser)]
 #[command(name = "mrsequential")]
 struct Args {
@@ -16,7 +14,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let args = Args::try_parse()?;
 
     println!("app: {}, files: {:?}", args.app, args.input_files);
-    let app = apps::get_app(args.app)?;
+    let app = distsys::mrapps::get_app(args.app)?;
 
     let mut intermediate = vec![];
     for file in args.input_files {

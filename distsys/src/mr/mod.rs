@@ -1,5 +1,9 @@
 use std::pin::Pin;
 
+pub mod rpc;
+pub mod worker;
+pub mod master;
+
 pub struct KeyValue {
     pub key: String,
     pub value: String,
