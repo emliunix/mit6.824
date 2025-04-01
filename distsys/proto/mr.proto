@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+import "google/protobuf/empty.proto";
+
+package mr;
+
+service Master {
+  rpc genClientId (google.protobuf.Empty) returns (ClientId) {}
+  rpc getTask (GetTaskRequest) returns (stream Task) {}
+  rpc finishTask (FinishTaskRequest) returns (google.protobuf.Empty) {}
+  rpc heartbeat (stream Heartbeat) returns (google.protobuf.Empty) {}
+}
+
+message ClientId {
+  int64 id = 1;
+}
+
+message KeyValue {
+  string key = 1;
+  string value = 2;
+}
+
+message MapTask {
+  string app = 1;
+  repeated KeyValue data = 2;
+}
+
+message ReduceTask {
+  string app = 1;
+  string key = 2;
+  repeated string data = 3;
+}
+
+message Task {
+  int64 id = 1;
+  oneof TaskType {
+    MapTask map_task = 2;
+    ReduceTask reduce_task = 3;
+  }
+}
+
+message MapTaskResult {
+  repeated string output_files = 1;
+}
+
+message ReduceTaskResult {
+  repeated string output_files = 1;
+}
+
+message TaskResult {
+  int64 id = 1;
+  oneof TaskResultType {
+    MapTaskResult map_task_result = 2;
+    ReduceTaskResult reduce_task_result = 3;
+  }
+}
+
+message GetTaskRequest {
+  ClientId client_id = 1;
+}
+
+message FinishTaskRequest {
+  ClientId client_id = 1;
+  int64 task_id = 2;
+  bool is_error = 3;
+  optional string error_msg = 4;
+  optional TaskResult result = 5;
+}
+
+message Heartbeat {
+  ClientId client_id = 1;
+}

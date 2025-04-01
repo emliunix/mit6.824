@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use futures::FutureExt;
 use tokio::{net::UnixStream, sync::oneshot, time};
 use tonic::{transport::Uri, Request};
 use tower::service_fn;
@@ -29,7 +30,10 @@ impl Worker {
         let client_id = client.gen_client_id(()).await?.into_inner();
         log::info!("Assigned client id: {:?}", client_id.id);
 
-        let (sender, mut receiver) = oneshot::channel::<()>();
+        let (shutdown_sender, shutdown) = oneshot::channel::<()>();
+        let shutdown = async move {
+            shutdown.await.unwrap_or(());
+        }.shared();
 
         // heartbeats
         let fut_heartbeat = {
@@ -40,9 +44,14 @@ impl Worker {
                         client_id: Some(client_id.clone()),
                     };
 
-                    while receiver.try_recv().is_err() {
-                        yield hb.clone();
-                        time::sleep(Duration::from_secs(5)).await;
+                    log::info!("Sending heartbeat");
+                    loop {
+                        log::debug!("tick heartbeat");
+                        yield hb;
+                        tokio::select! {
+                            _ = time::sleep(Duration::from_secs(5)) => {}
+                            _ = shutdown.clone() => { return; }
+                        }
                     }
                 })).await?;
                 Ok::<_, anyhow::Error>(())
@@ -52,18 +61,32 @@ impl Worker {
         let fut_processing = {
             let mut client = client.clone();
             async move {
-                let mut tasks = client.get_task(client_id.clone()).await?.into_inner();
+                let mut tasks = client.get_task(proto::GetTaskRequest { client_id: Some(client_id.clone()) }).await?.into_inner();
+                log::info!("Receiving tasks stream");
                 loop {
                     let msg = tasks.message().await?;
                     if let Some(task) = msg {
                         log::info!("task: {:?}", task);
+                        time::sleep(Duration::from_secs(1)).await; // Simulate task processing
+                        client.finish_task(proto::FinishTaskRequest {
+                            client_id: Some(client_id.clone()),
+                            task_id: task.id,
+                            is_error: false,
+                            error_msg: None,
+                            result: Some(proto::TaskResult {
+                                id: task.id,
+                                task_result_type: Some(proto::task_result::TaskResultType::MapTaskResult(proto::MapTaskResult {
+                                    output_files: vec![],
+                                })),
+                            }),
+                        }).await?;
                     } else {
                         log::info!("No more tasks");
                         break;
                     }
                 }
                 tasks.trailers().await?;
-                sender.send(()).unwrap();
+                shutdown_sender.send(()).unwrap();
                 Ok::<_, anyhow::Error>(())
             }
         };
