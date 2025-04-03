@@ -11,7 +11,7 @@ use super::rpc::{master_sock, proto};
 struct Task {
     id: i64,
     task: proto::Task,
-    oneshot: oneshot::Sender<proto::TaskResult>,
+    oneshot: oneshot::Sender<proto::task_result::TaskResultType>,
 }
 
 struct WorkerConnection {
@@ -24,7 +24,6 @@ struct MasterInner {
     client_seq: i64,
     task_seq: i64,
     task_queue: VecDeque<Task>,
-    is_dispatching: bool,
     workers: Vec<WorkerConnection>,
     workers_heap: BinaryHeap<(usize, usize)>, // (remaining_tasks, worker_index)
 }
@@ -66,7 +65,7 @@ impl proto::master_server::Master for MasterServer {
                         yield task;
                     }
                     else => {
-                        log::info!("No more tasks");
+                        log::info!("Worker#{} disconnected", id);
                         break;
                     }
                 }
@@ -76,9 +75,16 @@ impl proto::master_server::Master for MasterServer {
 
     async fn finish_task(&self, request: Request<proto::FinishTaskRequest>) -> Result<Response<()>, Status> {
         let task = request.into_inner();
-        log::info!("Worker#{} finished task#{}, is_error: {}, error_msg: {}",
-                   task.client_id.unwrap().id, task.task_id,
+        let client_id = task.client_id.unwrap().id;
+        let task_id = task.task_id;
+        log::debug!("Worker#{} finished task#{}, is_error: {}, error_msg: {}",
+                   client_id, task_id,
                    task.is_error, task.error_msg.unwrap_or_else(|| "".to_string()));
+        if task.is_error {
+            self.fail_task(client_id, task_id).await;
+        } else {
+            self.finish_task(client_id, task_id, task.result.unwrap()).await;
+        }
         Ok(Response::new(()))
     }
 
@@ -89,7 +95,7 @@ impl proto::master_server::Master for MasterServer {
             match hbs.message().await {
                 Ok(Some(hb)) => {
                     client_id = hb.client_id;
-                    log::debug!("Heartbeat from client: {:?}", client_id);
+                    log::trace!("Heartbeat from client: {:?}", client_id);
                 }
                 Ok(None) => break,
                 Err(e) => {
@@ -100,7 +106,7 @@ impl proto::master_server::Master for MasterServer {
         }
         // client exits
         if let Some(client_id) = client_id {
-            log::info!("Client {} exited", client_id.id);
+            log::info!("Worker#{} exited", client_id.id);
             self.evict_client(client_id.id).await;
         }
         Ok(Response::new(()))
@@ -113,7 +119,6 @@ impl MasterServer {
             client_seq: 0,
             task_seq: 0,
             task_queue: VecDeque::new(),
-            is_dispatching: false,
             workers: Vec::new(),
             workers_heap: BinaryHeap::new(),
         }));
@@ -144,7 +149,7 @@ impl MasterServer {
 
     /* -- called by main task -- */
 
-    async fn schedule_task(&self, task: proto::task::TaskType) -> Result<proto::TaskResult, anyhow::Error> {
+    async fn schedule_task(&self, task: proto::task::TaskType) -> Result<proto::task_result::TaskResultType, anyhow::Error> {
         let (oneshot, receiver) = oneshot::channel();
         let id = self.new_task_id().await;
         let task = Task {
@@ -156,9 +161,15 @@ impl MasterServer {
             oneshot,
         };
         self.enqueue_task(task).await;
-        self.dispatch_task().await;
+        self.try_dispatch_task().await;
 
-        Ok(receiver.await?)
+        let res = receiver.await?;
+        Ok(res)
+    }
+
+    async fn shutdown(&self) {
+        let mut inner = self.inner.lock().await;
+        inner.clear_clients();
     }
 
     /* -- called by worker -- */
@@ -169,16 +180,23 @@ impl MasterServer {
     }
 
     async fn add_client(&self, client: WorkerConnection) {
-        let mut inner = self.inner.lock().await;
-        inner.add_client(client)
+        {
+            let mut inner = self.inner.lock().await;
+            inner.add_client(client);
+        }
+        // in case tasks pending
+        self.try_dispatch_task().await;
     }
 
     async fn evict_client(&self, client_id: i64) {
+        let mut had_worker = false;
         {
             let mut inner = self.inner.lock().await;
-            inner.evict_client_and_requeue(client_id);
+            had_worker = inner.evict_client_and_requeue(client_id);
         }
-        self.dispatch_task().await;
+        if had_worker {
+            self.try_dispatch_task().await;
+        }
     }
 
     async fn fail_task(&self, worker: i64, task: i64) {
@@ -189,10 +207,10 @@ impl MasterServer {
         }
     }
 
-    async fn finish_task(&self, worker: i64, result: proto::TaskResult) {
+    async fn finish_task(&self, worker: i64, task: i64, result: proto::TaskResult) {
         let mut inner = self.inner.lock().await;
-        if let Some(task) = inner.remove_task(worker, result.id) {
-            log::info!("Finishing task#{}: {:?}", task.id, task.task);
+        if let Some(task) = inner.remove_task(worker, task) {
+            log::debug!("Finishing task#{}: {:?}", task.id, task.task);
             // send result to worker
             let _ = task.oneshot.send(result.clone());
         }
@@ -200,31 +218,20 @@ impl MasterServer {
 
     /* -- dispatching -- */
 
-    async fn dispatch_task(&self) {
-        {
-            let mut inner = self.inner.lock().await;
-            if inner.is_dispatching {
-                return;
-            }
-            inner.is_dispatching = true;
-        }
-
-        loop  {
-            let mut inner = self.inner.lock().await;
-            let should_delay = match inner.dispatch_task_1() {
+    async fn try_dispatch_task(&self) {
+        log::debug!("Dispatching tasks");
+        let mut inner = self.inner.lock().await;
+        loop {
+            match inner.dispatch_task_1() {
+                DispatchResult::HasMoreTasks => (),
                 DispatchResult::Done => {
-                    inner.is_dispatching = false;
                     break;
                 }
-                DispatchResult::HasMoreTasks => false,
                 DispatchResult::NoWorker => {
                     log::warn!("No available workers to dispatch task");
-                    true
+                    break;
                 },
             };
-            if should_delay {
-                time::sleep(Duration::from_secs(1)).await;
-            }
         }
     }
 
@@ -261,19 +268,25 @@ impl MasterInner {
         self.workers_heap.push((0, self.workers.len() - 1));
     }
 
-    fn evict_client_and_requeue(&mut self, client_id: i64) {
+    fn clear_clients(&mut self) {
+        self.workers.clear();
+        self.workers_heap.clear();
+    }
+
+    fn evict_client_and_requeue(&mut self, client_id: i64) -> bool {
         let i = if let Some((i, _)) = self.workers.iter().enumerate().find(|(_, w)| w.id == client_id) { i }
-        else { log::warn!("worker#{} not found", client_id); return; };
+        else { log::warn!("worker#{} not found", client_id); return false; };
         let w = self.workers.remove(i);
         self.workers_heap.retain(|(_, j)| *j != i);
         log::info!("Evicting worker#{} and requeue {} tasks", client_id, w.tasks.len());
         self.task_queue.extend(w.tasks.into_values());
+        true
     }
 
     fn dispatch_task_1(&mut self) -> DispatchResult {
         if let Some(&(_, worker_index)) = self.workers_heap.peek() {
             if let Some(task) = self.task_queue.pop_front() {
-                log::info!("Dispatching task#{} to worker#{}", task.id, self.workers[worker_index].id);
+                log::debug!("Dispatching task#{} to worker#{}", task.id, self.workers[worker_index].id);
                 let worker = &mut self.workers[worker_index];
                 if let Err(mpsc::error::SendError(_)) = worker.task_sender.send(task.task.clone()) {
                     let worker_id = worker.id;
@@ -281,6 +294,7 @@ impl MasterInner {
                     self.task_queue.push_front(task);
                     self.evict_client_and_requeue(worker_id);
                 } else {
+                    log::debug!("Task#{} sent to worker#{}", task.id, worker.id);
                     // task sent successfully, update heap to relfect n_processing change
                     worker.tasks.insert(task.id, task);
                     let ntasks = worker.tasks.len();
@@ -337,6 +351,29 @@ impl Master {
     }
 }
 
+async fn run_tasks<TI>(server: &MasterServer, tasks: TI) -> Result<Vec<proto::task_result::TaskResultType>, anyhow::Error>
+where
+    TI: IntoIterator<Item = proto::task::TaskType>,
+{
+    let res = Arc::new(Mutex::new(BTreeMap::new()));
+    stream::iter(tasks).enumerate().for_each_concurrent(10, |(i, task)| {
+        let res = res.clone();
+        let server = server.clone();
+        async move {
+            let mut res = res.lock().await;
+            res.insert(i, server.schedule_task(task).await);
+        }
+    }).await;
+    let res = Arc::try_unwrap(res).unwrap().into_inner();
+    let res_len = res.len();
+    let mut out = Vec::with_capacity(res_len);
+    for v in res.into_values() {
+        let v = v?;
+        out.push(v);
+    }
+    Ok(out)
+}
+
 async fn master_task(shutdown_sender: oneshot::Sender<()>, server: MasterServer) -> Result<(), anyhow::Error> {
     //     server.schedule_task(task);
     let map_tasks = vec![
@@ -355,27 +392,9 @@ async fn master_task(shutdown_sender: oneshot::Sender<()>, server: MasterServer)
         }),
     ];
 
-    run_tasks(server, map_tasks).await;
+    run_tasks(&server, map_tasks).await;
     log::info!("All tasks completed, shutting down");
+    server.shutdown().await;
     let _ = shutdown_sender.send(());
     Ok(())
-}
-
-async fn run_tasks<TI>(server: MasterServer, tasks: TI)
-where
-    TI: IntoIterator<Item = proto::task::TaskType>,
-{
-    stream::iter(tasks).for_each_concurrent(10, move |t| {
-        let server = server.clone();
-        async move {
-            match server.schedule_task(t).await {
-                Err(err) => {
-                    log::error!("Task failed: {:?}", err);
-                },
-                Ok(result) => {
-                    log::info!("Task result: {:?}", result);
-                }
-            }
-        }
-    }).await;
 }
