@@ -22,13 +22,14 @@ message KeyValue {
 
 message MapTask {
   string app = 1;
-  repeated KeyValue data = 2;
+  int64 n_partitions = 2;
+  string input_file = 3;
 }
 
 message ReduceTask {
   string app = 1;
-  string key = 2;
-  repeated string data = 3;
+  int64 partition = 2;
+  repeated string input_files = 3;
 }
 
 message Task {
@@ -39,8 +40,13 @@ message Task {
   }
 }
 
+message MapTaskResultEntry {
+  int64 partition = 1;
+  string output_file = 2;
+}
+
 message MapTaskResult {
-  repeated string output_files = 1;
+  repeated MapTaskResultEntry outputs = 1;
 }
 
 message ReduceTaskResult {
